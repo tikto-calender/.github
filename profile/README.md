@@ -1,49 +1,60 @@
 # TikTo Calendar
 
-TikTo là ứng dụng quản lý công việc, lịch sự kiện và thông báo. Giao diện web, API và Notification Service nằm ở các repository riêng, với hạ tầng AWS được quản lý bằng Terraform.
+TikTo Calendar is a web app for managing tasks and calendar events. Its dashboard shows upcoming work, service health and component versions, and lets you send a test notification.
 
-## Kiến trúc
+## Cloud architecture
+
+Dev and Prod share one Amazon EKS cluster in Sydney (`ap-southeast-2`). Each environment has its own namespace, Application Load Balancer (ALB) and DynamoDB table. Backend accesses its table through EKS Pod Identity.
 
 ```mermaid
 flowchart LR
-    Browser[Trình duyệt] --> CF[CloudFront theo môi trường]
-    CF -->|Static assets| S3[S3 private · Vite frontend]
-    CF -->|/api/*| Entry{API origin}
-    Entry -->|Dev · ALB giới hạn nguồn truy cập| ECS[Backend · ECS Fargate]
-    Entry -->|Prod · VPC Origin và ALB nội bộ| EKS[Backend · EKS]
-    ECS --> DevDB[(DynamoDB Dev)]
-    EKS --> ProdDB[(DynamoDB Prod)]
-    ECS -->|ECS Service Connect| Notify[Notification Service · ECS Fargate]
+    Browser["Browser"] --> ALB["Environment ALB"]
+    subgraph EKS["Shared Amazon EKS cluster"]
+        subgraph App["Dev or Prod namespace"]
+            UI["Frontend"]
+            API["Backend"]
+            Notify["Notification Service"]
+        end
+    end
+    ALB -->|Web UI| UI
+    ALB -->|/api requests| API
+    API --> DB[("Environment DynamoDB table")]
+    API --> Notify
 ```
 
-CloudFront phục vụ giao diện và `/api/*` trên cùng một origin phía trình duyệt. Backend Node.js/Express xử lý task và event, lưu dữ liệu vào DynamoDB và gọi Notification Service qua HTTP. Notification Service dùng Python và lưu trạng thái thông báo trong bộ nhớ tiến trình.
+Terraform or CloudFormation provisions the AWS resources. Argo CD deploys the Helm chart from the Manifest repository.
 
-Terraform chia thành ba stack. `shared` quản lý VPC, ECR và các IAM role dùng chung cho GitHub Actions. `dev` và `prod` đọc output của `shared`, đồng thời có Terraform state và bảng DynamoDB riêng. GitHub Actions dùng OIDC để lấy quyền AWS tạm thời. Backend dùng ECS task role ở Dev và EKS Pod Identity ở Prod để truy cập bảng của môi trường tương ứng.
+## CI/CD workflow
 
-Trong Prod, Terraform dựng EKS và CloudWatch Observability. GitOps quản lý workload và ALB nội bộ. Sau khi ALB được tạo, Terraform có thể bật CloudFront VPC Origin để đưa `/api/*` vào cụm.
+```mermaid
+flowchart TD
+    PR["Pull request into dev"] --> CI["CI checks"]
+    CI -->|Merge into dev| Build["Deploy Dev builds and scans the image"]
+    Build --> Registry["Publish to GHCR and pin the digest in Manifest"]
+    Registry --> Dev["Argo CD syncs Dev"]
+    Dev -->|Verify Dev| Promote["Promote the same digest from Manifest"]
+    Promote --> Prod["Argo CD syncs Prod"]
+    Prod -->|Verify Prod| Release["Finalize release in the source repository"]
+```
 
-## Luồng CI/CD
+CI checks formatting, lint, tests and build or syntax. **Finalize release** tags the deployed source commit and creates the GitHub Release. [Shared workflows](https://github.com/tikto-calender/reusable-workflow)
 
-Các repository ứng dụng khai báo sự kiện và môi trường triển khai. Workflow dùng chung chạy các bước kiểm tra Node.js/Python và cung cấp các bước publish, deploy và promote container cho Backend.
-
-| Thành phần | CI cho PR vào `dev` | Sau khi push vào `dev` | Phát hành production |
-| --- | --- | --- | --- |
-| Frontend | Format, lint, test và build khi có thay đổi thuộc phạm vi CI. PR đủ điều kiện có thể được squash-merge tự động sau khi CI đạt. | Kiểm tra mã nguồn, build Vite, quét Trivy, upload assets lên S3 trước `index.html`, rồi invalidate CloudFront. Chạy theo bộ lọc đường dẫn. | Chạy **Release production** từ `dev` với version mới. Workflow kiểm tra source, đi qua GitHub Environment `prod`, build lại, deploy lên S3/CloudFront Prod rồi tạo GitHub Release. |
-| Backend | Format, lint, test và kiểm tra cú pháp chạy song song. Kết quả tập trung ở `checks / CI result`, sau đó merge thủ công. | Build và quét image bằng Trivy, push tag `sha-<full SHA>` lên ECR. Deploy bằng digest lên ECS và xác nhận đúng task revision đã rollout. | Push tag `vX.Y.Z` trên đúng commit đã deploy Dev thành công và có mặt trên cả `dev` lẫn `main`. Qua GitHub Environment `prod`, workflow gắn version cho digest đã kiểm chứng và mở PR GitOps. |
-| Notification Service | Format, lint, test và compile khi có thay đổi thuộc phạm vi CI. PR đủ điều kiện có thể được squash-merge tự động sau khi CI đạt. | Kiểm tra mã nguồn, build và quét image, rồi publish `dev-<12 ký tự SHA>` lên ECR. Chạy theo bộ lọc đường dẫn. | Chạy **Release production** từ `dev` với version mới. Qua GitHub Environment `prod`, workflow lấy image Dev tương ứng, quét lại bằng Trivy, publish tag `vX.Y.Z` và tạo GitHub Release. |
-
-**Backend production** chỉ bắt đầu rollout sau khi PR GitOps được merge. Argo CD đồng bộ thay đổi vào EKS. Kiểm tra trạng thái đồng bộ và sức khỏe workload trong Argo CD để xác nhận triển khai. Có thể rollback phiên bản ứng dụng bằng cách revert thay đổi image trong GitOps.
-
-**Notification Service** hoàn tất ở bước phát hành image. Việc cập nhật workload chạy image mới cần bước triển khai riêng.
-
-**Hạ tầng** chạy `terraform fmt` và `terraform validate` khi PR chạm vào cấu hình Terraform. Chạy thủ công workflow **Terraform validate and plan** để xem plan của `shared`, `dev` và `prod` dựa trên state hiện tại. `terraform apply` là bước vận hành riêng sau khi review plan.
+All three services use the same promotion workflow. Argo CD applies the updated image digest and Kubernetes rolls out the Deployment. [Promotion guide](https://github.com/tikto-calender/manifest#promote-to-production)
 
 ## Repositories
 
-| Repository | Phạm vi |
+| Repository | Purpose |
 | --- | --- |
-| [frontend](https://github.com/tikto-calender/frontend) | Giao diện Vite và triển khai S3/CloudFront |
-| [backend](https://github.com/tikto-calender/backend) | Express API, DynamoDB và tích hợp thông báo |
-| [notification-service](https://github.com/tikto-calender/notification-service) | API thông báo bằng Python và pipeline phát hành image |
-| [infra](https://github.com/tikto-calender/infra) | Terraform cho AWS edge, ECS, EKS, IAM và DynamoDB |
-| [reusable-workflow](https://github.com/tikto-calender/reusable-workflow) | Workflow GitHub Actions dùng chung |
+| [Frontend](https://github.com/tikto-calender/frontend) | Vite web app and dashboard |
+| [Backend](https://github.com/tikto-calender/backend) | Express API, task and event storage, and notification integration |
+| [Notification Service](https://github.com/tikto-calender/notification-service) | Python notification API and test alerts |
+| [Terraform](https://github.com/tikto-calender/infra) | AWS platform and EKS setup |
+| [CloudFormation](https://github.com/tikto-calender/infra-by-cloudformation) | AWS platform with separate data and runtime stacks |
+| [Manifest](https://github.com/tikto-calender/manifest) | Helm chart, Argo CD applications and Prod promotion workflows |
+| [Reusable Workflows](https://github.com/tikto-calender/reusable-workflow) | Shared CI, image publishing and release jobs |
+
+## Run locally
+
+With Node.js 24 or 22.13+ on the 22.x line, run `npm ci` and `npm run dev` in the Backend and Frontend repositories in separate terminals. Backend uses local JSON storage and Vite proxies API requests to port 3000. Open the app at [http://localhost:5173](http://localhost:5173).
+
+For the full demo, start the [Notification Service](https://github.com/tikto-calender/notification-service) on port 8000 and set `NOTIFICATION_SERVICE_URL=http://localhost:8000` in Backend's environment.

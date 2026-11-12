@@ -6,40 +6,15 @@ TikTo Calendar is a web app for managing tasks and calendar events. Its dashboar
 
 Dev and Prod share one Amazon EKS cluster in Sydney (`ap-southeast-2`). Each environment has its own namespace, Application Load Balancer (ALB) and DynamoDB table. Backend accesses its table through EKS Pod Identity.
 
-```mermaid
-flowchart LR
-    Browser["Browser"] --> ALB["Environment ALB"]
-    subgraph EKS["Shared Amazon EKS cluster"]
-        subgraph App["Dev or Prod namespace"]
-            UI["Frontend"]
-            API["Backend"]
-            Notify["Notification Service"]
-        end
-    end
-    ALB -->|Web UI| UI
-    ALB -->|/api requests| API
-    API --> DB[("Environment DynamoDB table")]
-    API --> Notify
-```
+![TikTo Calendar AWS architecture](../assets/Achitecture%20%281%29.gif)
 
 Terraform or CloudFormation provisions the AWS resources. Argo CD deploys the Helm chart from the Manifest repository.
 
 ## CI/CD workflow
 
-```mermaid
-flowchart TD
-    PR["Pull request into dev"] --> CI["CI checks"]
-    CI -->|Merge into dev| Build["Deploy Dev builds and scans the image"]
-    Build --> Registry["Publish to GHCR and pin the digest in Manifest"]
-    Registry --> Dev["Argo CD syncs Dev"]
-    Dev -->|Verify Dev| Promote["Promote the same digest from Manifest"]
-    Promote --> Prod["Argo CD syncs Prod"]
-    Prod -->|Verify Prod| Release["Finalize release in the source repository"]
-```
-
-CI checks formatting, lint, tests and build or syntax. **Finalize release** tags the deployed source commit and creates the GitHub Release. [Shared workflows](https://github.com/tikto-calender/reusable-workflow)
-
-All three services use the same promotion workflow. Argo CD applies the updated image digest and Kubernetes rolls out the Deployment. [Promotion guide](https://github.com/tikto-calender/manifest#promote-to-production)
+1. **Check changes.** GitHub Actions runs formatting, lint, tests and build or syntax checks.
+2. **Deploy to Dev.** The workflow builds and scans an image, pushes it to GHCR and records its digest in Manifest. Argo CD syncs the change to EKS.
+3. **Promote to Prod.** Reuse the digest verified in Dev. After Argo CD rolls it out and Prod is verified, **Finalize release** tags the source commit and creates a GitHub Release. [Promotion guide](https://github.com/tikto-calender/manifest#promote-to-production)
 
 ## Repositories
 
